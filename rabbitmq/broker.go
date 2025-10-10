@@ -221,17 +221,20 @@ func (brk *Broker) getPublishChannel() (*amqp.Channel, error) {
 		return nil, err
 	}
 
-	// 尝试从池中获取通道
-	select {
-	case ch := <-pool:
-		if ch == nil || ch.IsClosed() {
-			// 忽略已关闭的通道
-		} else {
+	// 尝试从池中获取通道, 跳过已关闭的通道
+	for i := 0; i < 3; i++ {
+		select {
+		case ch := <-pool:
+			if ch == nil || ch.IsClosed() {
+				// 忽略已关闭的通道, 继续尝试
+				continue
+			}
 			return ch, nil
-		}
 
-	case <-time.After(10 * time.Millisecond):
-		// 未获取到通道, 稍后创建新的
+		case <-time.After(10 * time.Millisecond):
+			// 未获取到通道, 跳出循环创建新的
+		}
+		break
 	}
 
 	// 池中没有可用通道, 创建一个新的
@@ -663,24 +666,35 @@ func (brk *Broker) stopAllSubscriptionTasks() {
 func (brk *Broker) restartAllSubscriptionTasks() {
 	brk.stopAllSubscriptionTasks()
 
+	// 获取连接 (需要在 subscriptionLock 之前, 避免违反加锁顺序)
 	conn, err := brk.getConnection()
 	if err != nil {
 		slog.Error("rabbitmq: 重启所有订阅失败", slog.Any("error", err))
 		return
 	}
 
+	// 复制订阅规格 (避免长时间持有锁)
 	brk.subscriptionLock.Lock()
-	defer brk.subscriptionLock.Unlock()
+	specs := maps.Clone(brk.subscriptionSpecs)
+	brk.subscriptionLock.Unlock()
 
-	for id := range brk.subscriptionSpecs {
-		task, err := brk.startSubscriptionTask(conn, brk.subscriptionSpecs[id])
+	// 在锁外重启订阅任务
+	var newTasks = make(map[string]*subscriptionTask)
+	for id, spec := range specs {
+		task, err := brk.startSubscriptionTask(conn, spec)
 		if err != nil {
 			slog.Error("rabbitmq: 重启订阅任务失败", slog.String("subscriptionId", id), slog.Any("error", err))
 			continue
 		}
-
-		brk.subscriptionTasks[task.id] = task
+		newTasks[task.id] = task
 	}
+
+	// 更新订阅任务映射
+	brk.subscriptionLock.Lock()
+	for id, task := range newTasks {
+		brk.subscriptionTasks[id] = task
+	}
+	brk.subscriptionLock.Unlock()
 }
 
 // ============================== 生命周期 ==============================
@@ -817,6 +831,15 @@ func (brk *Broker) switchToConnected(newConn *amqp.Connection) {
 		}
 	}()
 
+	// 检查代理是否已关闭
+	brk.connLock.Lock()
+	if brk.isClosed {
+		brk.connLock.Unlock()
+		slog.Warn("rabbitmq: 代理已关闭, 放弃建立连接")
+		return
+	}
+	brk.connLock.Unlock()
+
 	adminChannel, err := newConn.Channel()
 	if err != nil {
 		slog.Error("rabbitmq: 创建通道失败", slog.Any("error", err))
@@ -860,6 +883,12 @@ func (brk *Broker) switchToConnected(newConn *amqp.Connection) {
 
 	brk.connLock.Lock()
 	{
+		// 再次检查代理是否已关闭
+		if brk.isClosed {
+			brk.connLock.Unlock()
+			slog.Warn("rabbitmq: 代理已关闭, 放弃建立连接")
+			return
+		}
 		brk.connection = newConn
 		brk.publishChanPool = publishPool
 	}
