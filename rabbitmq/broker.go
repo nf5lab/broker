@@ -259,15 +259,18 @@ func (brk *Broker) releasePublishChannel(channel *amqp.Channel) {
 		return
 	}
 
-	pool, err := brk.getPublishChannelPool()
-	if err != nil {
-		// 池不可用, 直接关闭
+	// 需要加锁, 避免操作已关闭的池, 导致 panic
+	brk.connLock.Lock()
+	defer brk.connLock.Unlock()
+
+	if brk.isClosed || brk.publishChanPool == nil {
+		// 代理已关闭或池不可用, 直接关闭
 		closeChannel(channel)
 		return
 	}
 
 	select {
-	case pool <- channel:
+	case brk.publishChanPool <- channel:
 	default:
 		// 通道池已满
 		closeChannel(channel)
