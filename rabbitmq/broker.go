@@ -471,6 +471,12 @@ func (brk *Broker) processMessage(task *subscriptionTask, amqpDelivery *amqp.Del
 
 	// 发布重试消息
 	if err := brk.publishRetryMessage(ctx, task, amqpDelivery); err != nil {
+		slog.Warn(
+			"rabbitmq: 发布重试消息失败",
+			slog.String("messageId", delivery.Message.Id),
+			slog.Any("error", err),
+		)
+
 		// 重试失败, 重新入队
 		rejectDelivery(amqpDelivery, true)
 	} else {
@@ -481,18 +487,6 @@ func (brk *Broker) processMessage(task *subscriptionTask, amqpDelivery *amqp.Del
 
 // publishRetryMessage 发布重试消息
 func (brk *Broker) publishRetryMessage(ctx context.Context, task *subscriptionTask, amqpDelivery *amqp.Delivery) error {
-	var topic string
-	if val, ok := getHeaderOriginalTopic(amqpDelivery.Headers); ok {
-		topic = val
-	} else {
-		topic = amqpDelivery.RoutingKey
-	}
-
-	attempts, _ := getHeaderDeliveryAttempts(amqpDelivery.Headers)
-	if attempts < 1 {
-		attempts = 1
-	}
-
 	// 创建重试消息
 	retryMsg := amqp.Publishing{
 		MessageId:    amqpDelivery.MessageId,
@@ -505,10 +499,23 @@ func (brk *Broker) publishRetryMessage(ctx context.Context, task *subscriptionTa
 		Expiration:   amqpDelivery.Expiration,
 	}
 
-	// 额外消息头
+	// 原始主题
+	if originalTopic, ok := getHeaderOriginalTopic(amqpDelivery.Headers); ok {
+		setHeaderOriginalTopic(retryMsg.Headers, originalTopic)
+	} else {
+		setHeaderOriginalTopic(retryMsg.Headers, amqpDelivery.RoutingKey)
+	}
+
+	// 投递次数
+	var attempts = 1
+	if val, ok := getHeaderDeliveryAttempts(amqpDelivery.Headers); ok {
+		if val > 1 {
+			attempts = val
+		}
+	}
+
 	attempts++
-	setHeaderOriginalTopic(retryMsg.Headers, topic)       // 原始主题
-	setHeaderDeliveryAttempts(retryMsg.Headers, attempts) // 投递次数
+	setHeaderDeliveryAttempts(retryMsg.Headers, attempts)
 
 	// 计算重试退避时间
 	retryCount := attempts - 1
@@ -520,7 +527,7 @@ func (brk *Broker) publishRetryMessage(ctx context.Context, task *subscriptionTa
 
 	var (
 		retryExchangeName = genRetryExchangeName(brk.exchangeName)
-		retryQueueName    = genRetryQueueName(brk.exchangeName, topic, task.group, backoff)
+		retryQueueName    = genRetryQueueName(brk.exchangeName, task.topic, task.group, backoff)
 	)
 
 	// 从发布通道池获取通道
@@ -531,7 +538,7 @@ func (brk *Broker) publishRetryMessage(ctx context.Context, task *subscriptionTa
 	defer brk.releasePublishChannel(ch)
 
 	// 确保重试队列存在
-	if err := brk.ensureRetryQueue(ch, topic, task.group, backoff); err != nil {
+	if err := brk.ensureRetryQueue(ch, task.topic, task.group, backoff); err != nil {
 		return err
 	}
 
