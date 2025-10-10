@@ -16,6 +16,10 @@ import (
 	"github.com/nf5lab/broker"
 )
 
+const (
+	publishPoolSize = 32
+)
+
 // Broker RabbitMQ 消息代理
 //
 // 加锁说明:
@@ -30,10 +34,13 @@ type Broker struct {
 	exchangeName  string
 
 	// 连接管理
-	connLock       sync.Mutex
-	isClosed       bool
-	connection     *amqp.Connection
-	publishChannel *amqp.Channel
+	connLock   sync.Mutex
+	isClosed   bool
+	connection *amqp.Connection
+
+	// 发布通道池
+	publishChanPool chan *amqp.Channel
+	publishPoolSize int
 
 	// 后台任务
 	cancelCtx  context.Context
@@ -93,6 +100,7 @@ func NewBroker(connectionUrl string, exchangeName string) (*Broker, error) {
 		connectionUrl:     connectionUrl,
 		exchangeName:      exchangeName,
 		isClosed:          false,
+		publishPoolSize:   publishPoolSize,
 		cancelCtx:         cancelCtx,
 		cancelFunc:        cancelFunc,
 		subscriptionSpecs: make(map[string]*subscriptionSpec),
@@ -164,6 +172,7 @@ func (brk *Broker) Publish(ctx context.Context, topic string, msg *broker.Messag
 	if err != nil {
 		return err
 	}
+	defer brk.releasePublishChannel(ch)
 
 	// 发布延迟消息
 	if delay := normalizeDelay(options.Delay); delay > 0 {
@@ -205,8 +214,68 @@ func (brk *Broker) ensureDelayQueue(ch *amqp.Channel, topic string, delay time.D
 	return nil
 }
 
-// getPublishChannel 获取发布通道 (线程安全)
+// getPublishChannel 从发布通道池获取通道 (线程安全)
 func (brk *Broker) getPublishChannel() (*amqp.Channel, error) {
+	pool, err := brk.getPublishChannelPool()
+	if err != nil {
+		return nil, err
+	}
+
+	// 尝试从池中获取通道
+	select {
+	case ch := <-pool:
+		if ch == nil || ch.IsClosed() {
+			// 忽略已关闭的通道
+		} else {
+			return ch, nil
+		}
+
+	case <-time.After(10 * time.Millisecond):
+		// 未获取到通道, 稍后创建新的
+	}
+
+	// 池中没有可用通道, 创建一个新的
+	conn, err := brk.getConnection()
+	if err != nil {
+		return nil, err
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("rabbitmq: 创建发布通道失败: %w", err)
+	}
+
+	if err := ch.Confirm(false); err != nil {
+		closeChannel(ch)
+		return nil, fmt.Errorf("rabbitmq: 发布通道开启确认模式失败: %w", err)
+	}
+
+	return ch, nil
+}
+
+// releasePublishChannel 归还发布通道
+func (brk *Broker) releasePublishChannel(channel *amqp.Channel) {
+	if channel == nil || channel.IsClosed() {
+		return
+	}
+
+	pool, err := brk.getPublishChannelPool()
+	if err != nil {
+		// 池不可用, 直接关闭
+		closeChannel(channel)
+		return
+	}
+
+	select {
+	case pool <- channel:
+	default:
+		// 通道池已满
+		closeChannel(channel)
+	}
+}
+
+// getPublishChannelPool 获取发布通道池 (线程安全)
+func (brk *Broker) getPublishChannelPool() (chan *amqp.Channel, error) {
 	brk.connLock.Lock()
 	defer brk.connLock.Unlock()
 
@@ -214,28 +283,11 @@ func (brk *Broker) getPublishChannel() (*amqp.Channel, error) {
 		return nil, errors.New("rabbitmq: 代理已关闭")
 	}
 
-	if brk.publishChannel == nil || brk.publishChannel.IsClosed() {
-		if brk.connection == nil || brk.connection.IsClosed() {
-			return nil, errors.New("rabbitmq: 连接不可用")
-		}
-
-		newChannel, err := brk.connection.Channel()
-		if err != nil {
-			return nil, fmt.Errorf("rabbitmq: 创建发布通道失败: %w", err)
-		}
-
-		if err := newChannel.Confirm(false); err != nil {
-			closeChannel(newChannel)
-			return nil, fmt.Errorf("rabbitmq: 发布通道开启确认模式失败: %w", err)
-		}
-
-		if brk.publishChannel != nil {
-			closeChannel(brk.publishChannel)
-		}
-		brk.publishChannel = newChannel
+	if brk.publishChanPool == nil {
+		return nil, errors.New("rabbitmq: 代理不可用")
 	}
 
-	return brk.publishChannel, nil
+	return brk.publishChanPool, nil
 }
 
 // ============================== 订阅管理 ==============================
@@ -468,13 +520,20 @@ func (brk *Broker) publishRetryMessage(ctx context.Context, task *subscriptionTa
 		retryQueueName    = genRetryQueueName(brk.exchangeName, topic, task.group, backoff)
 	)
 
+	// 从发布通道池获取通道
+	ch, err := brk.getPublishChannel()
+	if err != nil {
+		return err
+	}
+	defer brk.releasePublishChannel(ch)
+
 	// 确保重试队列存在
-	if err := brk.ensureRetryQueue(task.channel, topic, task.group, backoff); err != nil {
+	if err := brk.ensureRetryQueue(ch, topic, task.group, backoff); err != nil {
 		return err
 	}
 
 	retryRoutingKey := retryQueueName // 注意: 路由键就是重试队列的名称
-	return publishMaybeConfirm(ctx, task.channel, retryExchangeName, retryRoutingKey, retryMsg)
+	return publishMaybeConfirm(ctx, ch, retryExchangeName, retryRoutingKey, retryMsg)
 }
 
 // ensureRetryQueue 确保重试队列存在 (线程安全)
@@ -654,10 +713,10 @@ func (brk *Broker) Close() error {
 
 	brk.connLock.Lock()
 	{
-		// 关闭发布通道
-		if brk.publishChannel != nil {
-			closeChannel(brk.publishChannel)
-			brk.publishChannel = nil
+		// 关闭发布通道池
+		if brk.publishChanPool != nil {
+			brk.closePool(brk.publishChanPool)
+			brk.publishChanPool = nil
 		}
 
 		// 关闭连接
@@ -717,14 +776,15 @@ func (brk *Broker) autoReconnect() {
 func (brk *Broker) switchToDisconnected() {
 	slog.Info("rabbitmq: 连接已断开")
 
-	// 关闭连接和通道
 	brk.connLock.Lock()
 	{
-		if brk.publishChannel != nil {
-			closeChannel(brk.publishChannel)
-			brk.publishChannel = nil
+		// 关闭发布通道池
+		if brk.publishChanPool != nil {
+			brk.closePool(brk.publishChanPool)
+			brk.publishChanPool = nil
 		}
 
+		// 关闭连接
 		if brk.connection != nil {
 			closeConn(brk.connection)
 			brk.connection = nil
@@ -754,31 +814,51 @@ func (brk *Broker) switchToConnected(newConn *amqp.Connection) {
 		}
 	}()
 
-	publishChannel, err := newConn.Channel()
+	adminChannel, err := newConn.Channel()
 	if err != nil {
-		slog.Error("rabbitmq: 创建发布通道失败", slog.Any("error", err))
+		slog.Error("rabbitmq: 创建通道失败", slog.Any("error", err))
 		return
 	}
+	defer closeChannel(adminChannel)
+
+	if err := declareMainExchange(adminChannel, brk.exchangeName); err != nil {
+		slog.Error("rabbitmq: 声明主交换机失败", slog.Any("error", err))
+		return
+	}
+
+	// 初始化发布通道池
+	publishPool := make(chan *amqp.Channel, brk.publishPoolSize)
 	defer func() {
 		if !success {
-			closeChannel(publishChannel)
+			brk.closePool(publishPool)
 		}
 	}()
 
-	if err := publishChannel.Confirm(false); err != nil {
-		slog.Error("rabbitmq: 发布通道开启确认模式失败", slog.Any("error", err))
-		return
-	}
+	for i := 0; i < brk.publishPoolSize; i++ {
+		ch, err := newConn.Channel()
+		if err != nil {
+			slog.Error("rabbitmq: 创建发布通道失败", slog.Any("error", err))
+			return
+		}
 
-	if err := declareMainExchange(publishChannel, brk.exchangeName); err != nil {
-		slog.Error("rabbitmq: 声明主交换机失败", slog.Any("error", err))
-		return
+		if err := ch.Confirm(false); err != nil {
+			closeChannel(ch)
+			slog.Error("rabbitmq: 发布通道开启确认模式失败", slog.Any("error", err))
+			return
+		}
+
+		select {
+		case publishPool <- ch:
+		default:
+			// 通道池已满, 关闭多余通道
+			closeChannel(ch)
+		}
 	}
 
 	brk.connLock.Lock()
 	{
 		brk.connection = newConn
-		brk.publishChannel = publishChannel
+		brk.publishChanPool = publishPool
 	}
 	brk.connLock.Unlock()
 
@@ -787,4 +867,18 @@ func (brk *Broker) switchToConnected(newConn *amqp.Connection) {
 
 	// 设置成功标记
 	success = true
+}
+
+// closePool 关闭通道池
+func (brk *Broker) closePool(pool chan *amqp.Channel) {
+	if pool == nil {
+		return
+	}
+
+	close(pool)
+	for ch := range pool {
+		if ch != nil {
+			closeChannel(ch)
+		}
+	}
 }
