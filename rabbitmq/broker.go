@@ -259,7 +259,10 @@ func (brk *Broker) releasePublishChannel(channel *amqp.Channel) {
 		return
 	}
 
-	// 需要加锁, 避免操作已关闭的池, 导致 panic
+	// 注意: 这里需要单独加锁
+	//
+	// 不能使用 getPublishChannelPool()
+	// 因为获取到的通道池可能已经被关闭, 可能会导致 panic
 	brk.connLock.Lock()
 	defer brk.connLock.Unlock()
 
