@@ -20,6 +20,11 @@ const (
 	publishPoolSize = 32
 )
 
+var (
+	// 确保实现了 broker.Broker 接口
+	_ broker.Broker = (*Broker)(nil)
+)
+
 // Broker RabbitMQ 消息代理
 //
 // 加锁说明:
@@ -126,6 +131,16 @@ func NewBroker(connectionUrl string, exchangeName string) (*Broker, error) {
 		slog.String("exchangeName", exchangeName),
 	)
 	return brk, nil
+}
+
+// NewPublisher 创建发布者 (只是 NewBroker 的别名)
+func NewPublisher(connectionUrl string, exchangeName string) (*Broker, error) {
+	return NewBroker(connectionUrl, exchangeName)
+}
+
+// NewSubscriber 创建订阅者 (只是 NewBroker 的别名)
+func NewSubscriber(connectionUrl string, exchangeName string) (*Broker, error) {
+	return NewBroker(connectionUrl, exchangeName)
 }
 
 // ============================== 发布管理 ==============================
