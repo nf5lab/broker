@@ -662,13 +662,26 @@ func (brk *Broker) stopSubscriptionTask(task *subscriptionTask) {
 		return
 	}
 
+	if task.channel != nil {
+		closeChannel(task.channel)
+	}
+
 	if task.cancelFunc != nil {
 		task.cancelFunc()
 	}
 
-	task.wait.Wait()
-	if task.channel != nil {
-		closeChannel(task.channel)
+	done := make(chan struct{})
+	go func() {
+		task.wait.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 正常退出
+	case <-time.After(5 * time.Second):
+		// 退出超时
+		slog.Warn("rabbitmq: 等待订阅任务退出超时", slog.String("subscriptionId", task.id))
 	}
 }
 
